@@ -1,0 +1,203 @@
+SMARTPARK KE - AUTOMATED PARKING MANAGEMENT SYSTEM
+====================================================
+Algorithms, Data Structures, and Database Design
+
+
+PART A: ALGORITHMS (per module)
+================================
+
+1. SLOT DISPLAY MODULE
+-----------------------
+Purpose: Show drivers live slot availability before entry.
+
+ALGORITHM get_slot_display():
+    total_slots = COUNT(all rows in slots table)
+    available   = COUNT(slots WHERE status = 'FREE')
+    grid        = [(slot_number, status) for each slot]
+    DISPLAY available, "/" , total_slots
+    DISPLAY grid (green = FREE, red = OCCUPIED)
+    RETURN grid
+
+
+2. VEHICLE ENTRY MODULE
+------------------------
+Purpose: Register a vehicle on arrival and assign it a slot.
+
+ALGORITHM vehicle_entry(plate_number):
+    IF plate_number is empty:
+        RETURN error "Plate number required"
+
+    normalise plate_number (trim spaces, uppercase)
+
+    existing_session = find ACTIVE session for plate_number
+    IF existing_session exists:
+        RETURN error "Vehicle already parked"
+
+    free_slot = find FIRST slot WHERE status = 'FREE'
+    IF free_slot is None:
+        RETURN error "Parking is full"
+
+    register plate_number in vehicle table (if new)
+    SET free_slot.status = 'OCCUPIED'
+    entry_time = current timestamp
+    CREATE session record (plate_number, slot_id, entry_time, paid=0, active=1)
+
+    RETURN ticket {session_id, plate_number, slot_number, entry_time}
+
+
+3. EXIT MODULE (duration + fee calculation)
+---------------------------------------------
+Purpose: On exit, calculate total time parked and amount owed.
+
+ALGORITHM vehicle_exit(plate_number):
+    normalise plate_number
+    session = find ACTIVE session for plate_number
+    IF session is None:
+        RETURN error "No active session found"
+
+    exit_time = current timestamp
+    duration_minutes = (exit_time - session.entry_time) in minutes
+
+    fee = calculate_fee(duration_minutes)
+
+    STORE exit_time, duration_minutes, fee on the session
+    (slot remains OCCUPIED until payment is confirmed)
+
+    RETURN {plate_number, duration_minutes, fee, session_id}
+
+
+ALGORITHM calculate_fee(duration_minutes):
+    tiers = READ pricing_tiers table, ordered by max_minutes ascending
+            (the "over X hours" tier has max_minutes = NULL and is last)
+    FOR each tier IN tiers:
+        IF tier.max_minutes IS NULL OR duration_minutes <= tier.max_minutes:
+            RETURN tier.fee
+    RETURN last tier.fee   // fallback safeguard
+
+    Client rate card (seeded into pricing_tiers):
+        <= 30 minutes  -> Free   (Kshs 0)
+        <= 2 hours     -> Kshs 50
+        <= 4 hours     -> Kshs 100
+        <= 6 hours     -> Kshs 300
+        > 6 hours      -> Kshs 500
+
+
+4. PAYMENT / BARRIER CONTROL MODULE
+-------------------------------------
+Purpose: Open the barrier only once the correct fee has been paid.
+
+ALGORITHM process_payment(session_id, amount_paid):
+    session = find session BY session_id
+    IF session is None:
+        RETURN error "Session not found"
+    IF session.fee is None:
+        RETURN error "Fee not yet calculated - call exit first"
+    IF amount_paid < session.fee:
+        RETURN error "Insufficient payment"
+
+    SET session.paid = 1
+    SET session.is_active = 0
+    SET slot.status = 'FREE'          // slot released back to the pool
+    OPEN barrier
+    (barrier closes automatically after the vehicle passes)
+
+    RETURN success {plate_number, fee_paid}
+
+
+5. REPORTING MODULE
+---------------------
+Purpose: Give management daily revenue and activity insight.
+
+ALGORITHM get_daily_report(date):
+    completed = all sessions WHERE is_active = 0 AND exit_time is on `date`
+    vehicles_served = COUNT(completed)
+    total_revenue    = SUM(completed.fee)
+    avg_duration     = AVERAGE(completed.duration_minutes)
+    RETURN {vehicles_served, total_revenue, avg_duration}
+
+
+PART B: DATA STRUCTURES USED AND REASONING
+=============================================
+
+1. Indexed / hash-style lookup on plate_number
+   Used in: finding a vehicle's active session on entry and exit.
+   Reason: plate_number is the primary key of the vehicle table and is
+   indexed in the session table lookups, giving near O(1) lookup instead
+   of scanning every session. This matters because entry/exit happen
+   frequently and must be fast at a real barrier.
+
+2. Fixed-size list (array) of slot records
+   Used in: the slot grid pulled from the slots table into memory for
+   display, and for the "first free slot" search.
+   Reason: the number of physical slots is small and bounded (tens to a
+   few hundred), so a simple linear scan for the first FREE slot is fast
+   enough and far simpler than a more complex structure.
+
+3. Append-only log (the session table itself)
+   Used in: session history / completed sessions.
+   Reason: sessions are never deleted, only marked is_active = 0. This
+   preserves a full audit trail for reporting without needing a
+   separate archive table or export process.
+
+4. Ordered/ranked table (pricing_tiers)
+   Used in: fee calculation.
+   Reason: tiers are read in ascending order of max_minutes and the
+   first matching tier wins - a simple ordered lookup. Storing tiers as
+   data (rather than hardcoded if/else thresholds in code) is what
+   makes the pricing "dynamic": an admin can edit, add, or remove a
+   tier without changing or redeploying code.
+
+5. Boolean flags (paid, is_active) rather than separate tables
+   Used in: session table.
+   Reason: distinguishing "currently parked", "awaiting payment", and
+   "completed & paid" with two flags avoids the overhead of moving rows
+   between multiple tables (e.g. active_sessions vs history) while
+   still making each state trivially queryable.
+
+
+PART C: DATABASE DESIGN (SQLite)
+===================================
+
+Tables
+------
+
+slots
+    id            INTEGER PRIMARY KEY AUTOINCREMENT
+    slot_number   TEXT UNIQUE NOT NULL        e.g. "A1"
+    status        TEXT NOT NULL               'FREE' or 'OCCUPIED'
+
+vehicle
+    plate_number  TEXT PRIMARY KEY
+    vehicle_type  TEXT DEFAULT 'car'
+
+session
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT
+    plate_number       TEXT NOT NULL   -> FOREIGN KEY vehicle(plate_number)
+    slot_id            INTEGER NOT NULL -> FOREIGN KEY slots(id)
+    entry_time         TEXT NOT NULL
+    exit_time          TEXT
+    duration_minutes   REAL
+    fee                REAL
+    paid               INTEGER DEFAULT 0   (0 = unpaid, 1 = paid)
+    is_active          INTEGER DEFAULT 1   (1 = currently parked, 0 = completed)
+
+pricing_tiers
+    id            INTEGER PRIMARY KEY AUTOINCREMENT
+    tier_name     TEXT NOT NULL       e.g. "Up to 2 hours"
+    max_minutes   INTEGER             NULL = final "and above" tier
+    fee           REAL NOT NULL
+
+Why this design is "dynamic"
+-----------------------------
+- Adding or removing physical parking bays only requires inserting or
+  updating rows in `slots` - no schema change.
+- Changing parking rates only requires editing rows in `pricing_tiers`
+  (e.g. changing a fee, or inserting a new tier for motorbikes) - the
+  fee calculation algorithm reads whatever rows exist at query time.
+- `session.is_active` and `session.paid` let the system distinguish
+  parked / awaiting-payment / completed states from one table, so
+  querying "who is currently parked" or "today's revenue" is a simple
+  WHERE clause rather than a join across several state tables.
+- Foreign keys (plate_number, slot_id) enforce that every session
+  always refers to a real, registered vehicle and slot, keeping the
+  data consistent as the system grows.
