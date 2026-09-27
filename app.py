@@ -16,6 +16,21 @@ Run as a web app:
 (opens in the default browser via ft.AppView.WEB_BROWSER)
 """
 
+import os
+import sys
+
+# When packaged with PyInstaller in windowed/no-console mode (which `flet
+# pack` uses by default), Windows gives the process no console — so
+# sys.stdout and sys.stderr are None instead of a stream. Uvicorn's
+# logging setup calls .isatty() on them without checking for None first,
+# which crashes on startup with "Unable to configure formatter 'default'".
+# Redirecting to a null stream keeps everything downstream (Flet, uvicorn)
+# happy without ever needing a real console window.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 import flet as ft
 
 import database as db
