@@ -7,10 +7,27 @@ separate from parking.py means the storage layer can be swapped out
 (e.g. for Postgres later) without touching business rules.
 """
 
+import os
+import sys
 import sqlite3
 from contextlib import contextmanager
 
-DB_NAME = "parking_system.db"
+
+def _resolve_db_path():
+    """Always place parking_system.db next to the running program, not
+    wherever the current working directory happens to be. A bare
+    relative filename depends on the launch context (double-click vs.
+    shortcut vs. command line can all set a different CWD), which is
+    what causes "unable to open database file" on some machines."""
+    if getattr(sys, "frozen", False):
+        # Running as a PyInstaller-built .exe
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, "parking_system.db")
+
+
+DB_NAME = _resolve_db_path()
 
 
 @contextmanager
