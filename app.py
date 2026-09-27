@@ -3,11 +3,13 @@ app.py
 -------
 SmartPark KE — Flet web UI.
 
-Four tabs map directly onto the four required modules:
-  1. Slot Display   -> live grid of FREE / OCCUPIED slots
-  2. Vehicle Entry   -> register arrival, assign slot
-  3. Exit & Payment   -> calculate fee, confirm payment, "open barrier"
-  4. Reports          -> daily revenue + session history
+Tabs map onto the required modules:
+  1. Slot Display      -> live grid of FREE / OCCUPIED slots
+  2. Vehicle Entry      -> register arrival, assign slot
+  3. Exit & Payment      -> calculate fee, confirm payment, "open barrier"
+  4. Parked Vehicles      -> everyone currently in the lot (live duration,
+                              or awaiting payment if they've already exited)
+  5. Reports               -> daily revenue + session history
 
 Run as a web app:
     python app.py
@@ -30,8 +32,9 @@ def main(page: ft.Page):
     # Tracks which session is currently awaiting payment on the Exit tab.
     current_exit_session = {"id": None}
 
-    # Slot Display
-
+    # -------------------------------------------------------------
+    # Tab 1: Slot Display
+    # -------------------------------------------------------------
     slot_grid_view = ft.GridView(
         expand=False,
         runs_count=5,
@@ -65,6 +68,21 @@ def main(page: ft.Page):
         )
         page.update()
 
+    # -- Admin: change total slot count --
+    total_slots_field = ft.TextField(label="Set Total Slots", width=180)
+    manage_slots_result = ft.Text(size=13)
+
+    def handle_set_total_slots(e):
+        result = parking.set_total_slots(total_slots_field.value)
+        if "error" in result:
+            manage_slots_result.value = result["error"]
+            manage_slots_result.color = ft.Colors.RED
+        else:
+            manage_slots_result.value = result["message"]
+            manage_slots_result.color = ft.Colors.GREEN_800
+            total_slots_field.value = ""
+        refresh_slot_grid()
+
     display_tab = ft.Column(
         [
             available_text,
@@ -74,12 +92,24 @@ def main(page: ft.Page):
                 on_click=lambda e: refresh_slot_grid(),
             ),
             slot_grid_view,
+            ft.Divider(),
+            ft.Text("Manage Capacity", size=16, weight=ft.FontWeight.BOLD),
+            ft.Row(
+                [
+                    total_slots_field,
+                    ft.ElevatedButton(
+                        "Apply", icon=ft.Icons.SETTINGS, on_click=handle_set_total_slots
+                    ),
+                ]
+            ),
+            manage_slots_result,
         ],
         spacing=15,
     )
 
+    # -------------------------------------------------------------
     # Tab 2: Vehicle Entry
-
+    # -------------------------------------------------------------
     entry_plate_field = ft.TextField(label="Vehicle Plate Number", width=300)
     entry_result = ft.Text(size=14)
 
@@ -110,8 +140,9 @@ def main(page: ft.Page):
         spacing=15,
     )
 
+    # -------------------------------------------------------------
     # Tab 3: Exit & Payment
-
+    # -------------------------------------------------------------
     exit_plate_field = ft.TextField(label="Vehicle Plate Number", width=300)
     exit_result = ft.Text(size=14)
     fee_due_text = ft.Text(size=16, weight=ft.FontWeight.BOLD)
@@ -138,6 +169,7 @@ def main(page: ft.Page):
             fee_due_text.value = f"Fee Due: Kshs {result['fee']}"
             amount_field.visible = True
             pay_button.visible = True
+        refresh_parked()
         page.update()
 
     def handle_payment(e):
@@ -163,6 +195,7 @@ def main(page: ft.Page):
             fee_due_text.value = ""
             current_exit_session["id"] = None
         refresh_slot_grid()
+        refresh_parked()
         page.update()
 
     pay_button = ft.ElevatedButton(
@@ -188,10 +221,110 @@ def main(page: ft.Page):
         spacing=15,
     )
 
-    # Tab 4: Reports
+    # -------------------------------------------------------------
+    # Tab 4: Parked Vehicles
+    # -------------------------------------------------------------
+    # Every vehicle currently in the lot: still parked (no exit request
+    # yet, duration ticks live) or already exited and awaiting payment
+    # (slot stays OCCUPIED until payment clears).
+    parked_summary = ft.Text(size=14, color=ft.Colors.GREY_800)
+    parked_list = ft.Column(spacing=8, height=340, scroll=ft.ScrollMode.AUTO)
 
+    def load_into_exit_tab(session_id, plate_number, duration_minutes, fee):
+        """Jump to the Exit & Payment tab pre-filled with this session,
+        so staff can complete payment without retyping the plate."""
+        current_exit_session["id"] = session_id
+        exit_plate_field.value = plate_number
+        exit_result.value = f"{plate_number} parked for {duration_minutes} minutes."
+        exit_result.color = ft.Colors.BLACK
+        fee_due_text.value = f"Fee Due: Kshs {fee}"
+        amount_field.visible = True
+        pay_button.visible = True
+        barrier_text.value = ""
+        tabs.selected_index = 2  # Exit & Payment tab
+        refresh_parked()
+        page.update()
+
+    def handle_row_request_exit(plate_number):
+        """Called from a parked vehicle's row when it has no exit_time
+        yet — runs the exit calculation, then hands off to payment."""
+        result = parking.vehicle_exit(plate_number)
+        if "error" in result:
+            exit_result.value = result["error"]
+            exit_result.color = ft.Colors.RED
+            tabs.selected_index = 2
+            refresh_parked()
+            page.update()
+            return
+        load_into_exit_tab(
+            result["session_id"],
+            result["plate_number"],
+            result["duration_minutes"],
+            result["fee"],
+        )
+
+    def refresh_parked(e=None):
+        parked = parking.get_parked_vehicles()
+        parked_summary.value = f"Currently Parked: {len(parked)}"
+        parked_list.controls.clear()
+        if not parked:
+            parked_list.controls.append(
+                ft.Text("No vehicles currently parked.", size=13, color=ft.Colors.GREY_600)
+            )
+        for s in parked:
+            already_exited = s["exit_time"] is not None
+            if already_exited:
+                detail = (
+                    f"{s['plate_number']} | Slot {s['slot_number']} | "
+                    f"entered {s['entry_time']} | exited {s['exit_time']} | "
+                    f"Kshs {s['fee']} due — AWAITING PAYMENT"
+                )
+                action_button = ft.ElevatedButton(
+                    "Pay Now",
+                    icon=ft.Icons.PAYMENT,
+                    on_click=lambda e, sess=s: load_into_exit_tab(
+                        sess["id"], sess["plate_number"], sess["duration_minutes"], sess["fee"]
+                    ),
+                )
+            else:
+                live_duration = parking.calculate_duration_minutes(
+                    s["entry_time"], parking.now_str()
+                )
+                detail = (
+                    f"{s['plate_number']} | Slot {s['slot_number']} | "
+                    f"entered {s['entry_time']} | parked {live_duration} min so far"
+                )
+                action_button = ft.ElevatedButton(
+                    "Request Exit",
+                    icon=ft.Icons.LOGOUT,
+                    on_click=lambda e, plate=s["plate_number"]: handle_row_request_exit(plate),
+                )
+            parked_list.controls.append(
+                ft.Row(
+                    [ft.Text(detail, size=12, expand=True), action_button],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                )
+            )
+        page.update()
+
+    parked_tab = ft.Column(
+        [
+            ft.Text("Parked Vehicles", size=18, weight=ft.FontWeight.BOLD),
+            ft.ElevatedButton(
+                "Refresh", icon=ft.Icons.REFRESH, on_click=refresh_parked
+            ),
+            parked_summary,
+            ft.Divider(),
+            parked_list,
+        ],
+        spacing=15,
+    )
+
+    # -------------------------------------------------------------
+    # Tab 5: Reports
+    # -------------------------------------------------------------
     report_text = ft.Text(size=14)
-    history_list = ft.Column(spacing=5)
+    history_list = ft.Column(spacing=5, height=340, scroll=ft.ScrollMode.AUTO)
 
     def refresh_reports(e=None):
         summary = parking.get_daily_report()
@@ -226,8 +359,9 @@ def main(page: ft.Page):
         spacing=15,
     )
 
+    # -------------------------------------------------------------
     # Layout
-    
+    # -------------------------------------------------------------
     tabs = ft.Tabs(
         selected_index=0,
         animation_duration=200,
@@ -235,9 +369,15 @@ def main(page: ft.Page):
             ft.Tab(text="Slot Display", icon=ft.Icons.GRID_VIEW, content=ft.Container(display_tab, padding=20)),
             ft.Tab(text="Vehicle Entry", icon=ft.Icons.DIRECTIONS_CAR, content=ft.Container(entry_tab, padding=20)),
             ft.Tab(text="Exit & Payment", icon=ft.Icons.PAYMENT, content=ft.Container(exit_tab, padding=20)),
+            ft.Tab(text="Parked Vehicles", icon=ft.Icons.DIRECTIONS_CAR_FILLED, content=ft.Container(parked_tab, padding=20)),
             ft.Tab(text="Reports", icon=ft.Icons.BAR_CHART, content=ft.Container(reports_tab, padding=20)),
         ],
-        expand=1,
+        # No expand=1 here: combined with the page's own scroll=AUTO,
+        # "expand" told Flet to fill an ambiguous/unbounded scroll area,
+        # which is what produced the blank scrollable space below the
+        # actual content. Letting Tabs size to its own content (each
+        # tab's own list already caps its height with its own scroll)
+        # keeps the whole page a fixed, finite height.
     )
 
     page.add(
@@ -248,6 +388,7 @@ def main(page: ft.Page):
     )
 
     refresh_slot_grid()
+    refresh_parked()
     refresh_reports()
 
 

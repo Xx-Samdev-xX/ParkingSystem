@@ -104,7 +104,66 @@ ALGORITHM process_payment(session_id, amount_paid):
     RETURN success {plate_number, fee_paid}
 
 
-5. REPORTING MODULE
+5. CAPACITY MANAGEMENT MODULE
+---------------------------------
+Purpose: Let an admin change the number of slots the lot has, up or down,
+without ever losing session history or disrupting a currently parked car.
+
+Note: a slot row is never physically deleted once created, because
+session records keep a foreign key to it (deleting it would break that
+link and destroy history). Instead, an `is_enabled` flag takes a slot
+in or out of service.
+
+ALGORITHM set_total_slots(target_count):
+    IF target_count < 0:
+        RETURN error "Slot count cannot be negative"
+
+    current = COUNT(slots WHERE is_enabled = 1)
+
+    IF target_count == current:
+        RETURN "No change"
+
+    IF target_count > current:
+        to_add = target_count - current
+        RETURN add_slots(to_add)
+
+    // target_count < current: shrinking
+    to_remove = current - target_count
+    RETURN disable_slots(to_remove)
+
+
+ALGORITHM add_slots(count):
+    added = []
+    // Reuse previously disabled slots first (keeps numbering compact)
+    disabled_slots = first `count` slots WHERE is_enabled = 0, oldest first
+    FOR each slot IN disabled_slots:
+        SET slot.is_enabled = 1, slot.status = 'FREE'
+        added.append(slot)
+
+    remaining = count - length(disabled_slots)
+    REPEAT remaining times:
+        CREATE new slot row (status='FREE', is_enabled=1)
+        added.append(new slot)
+
+    RETURN added
+
+
+ALGORITHM disable_slots(count):
+    // Only a FREE slot can be taken out of service — never one with a
+    // vehicle currently parked in it.
+    candidates = first `count` slots WHERE status='FREE' AND is_enabled=1,
+                 highest slot_number first
+    FOR each slot IN candidates:
+        SET slot.is_enabled = 0
+    shortfall = count - length(candidates)
+    RETURN {disabled: candidates, shortfall: shortfall}
+
+    // If shortfall > 0, not enough slots were free to fully reach the
+    // target — the caller is told exactly how many are still occupied
+    // and can retry once those vehicles exit.
+
+
+6. REPORTING MODULE
 ---------------------
 Purpose: Give management daily revenue and activity insight.
 
@@ -154,6 +213,14 @@ PART B: DATA STRUCTURES USED AND REASONING
    between multiple tables (e.g. active_sessions vs history) while
    still making each state trivially queryable.
 
+6. Boolean flag (is_enabled) for soft-deletion of slots
+   Used in: slots table, capacity management.
+   Reason: a slot cannot be physically deleted once referenced by a
+   session's foreign key without destroying history, so a flag models
+   "in service" vs "out of service" instead. This is the same pattern
+   as (5) applied to a different lifecycle: it lets capacity shrink and
+   grow without ever touching historical records.
+
 
 PART C: DATABASE DESIGN (SQLite)
 ===================================
@@ -165,6 +232,8 @@ slots
     id            INTEGER PRIMARY KEY AUTOINCREMENT
     slot_number   TEXT UNIQUE NOT NULL        e.g. "A1"
     status        TEXT NOT NULL               'FREE' or 'OCCUPIED'
+    is_enabled    INTEGER NOT NULL DEFAULT 1  1 = in service, 0 = removed
+                                               from capacity (never deleted)
 
 vehicle
     plate_number  TEXT PRIMARY KEY

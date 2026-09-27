@@ -172,6 +172,63 @@ def get_slot_grid():
     return db.get_slot_grid()
 
 
+def set_total_slots(target_count):
+    """
+    Changes the lot's capacity to target_count.
+
+    Algorithm:
+      1. Reject a negative target.
+      2. current = number of slots currently in service.
+      3. If target > current: add the difference (add_slots re-enables
+         previously disabled slots before creating brand-new ones).
+      4. If target < current: try to disable the difference. Only FREE
+         slots can be disabled, so if enough vehicles are currently
+         parked, the full reduction may not be possible in one call —
+         the shortfall is reported so the caller can retry once more
+         slots free up.
+      5. If target == current: no-op.
+    """
+    try:
+        target_count = int(target_count)
+    except (TypeError, ValueError):
+        return {"error": "Enter a whole number for total slots."}
+
+    if target_count < 0:
+        return {"error": "Slot count cannot be negative."}
+
+    current = db.count_total_slots()
+
+    if target_count == current:
+        return {"message": f"Already at {current} slots.", "total": current}
+
+    if target_count > current:
+        added = db.add_slots(target_count - current)
+        return {
+            "message": f"Added {len(added)} slot(s): {', '.join(added)}.",
+            "total": db.count_total_slots(),
+        }
+
+    # target_count < current: attempt to shrink capacity
+    to_remove = current - target_count
+    result = db.disable_slots(to_remove)
+    new_total = db.count_total_slots()
+
+    if result["shortfall"] > 0:
+        return {
+            "error": (
+                f"Only {len(result['disabled'])} of {to_remove} slot(s) could be "
+                f"freed up — {result['shortfall']} more are currently OCCUPIED. "
+                f"Total is now {new_total}; try again once those vehicles exit."
+            ),
+            "total": new_total,
+        }
+
+    return {
+        "message": f"Removed {len(result['disabled'])} slot(s): {', '.join(result['disabled'])}.",
+        "total": new_total,
+    }
+
+
 # ---------------------------------------------------------------------
 # Reporting Module
 # ---------------------------------------------------------------------
@@ -184,3 +241,9 @@ def get_daily_report(date_str=None):
 
 def get_history(limit=50):
     return db.get_history(limit)
+
+
+def get_parked_vehicles():
+    """Every vehicle currently in the lot: still parked (no exit request
+    yet) or already exited and awaiting payment."""
+    return db.get_parked_vehicles()

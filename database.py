@@ -2,7 +2,9 @@
 database.py
 ------------
 All SQLite access for SmartPark KE lives here. No business logic —
-just table creation, seeding, and simple CRUD queries.
+just table creation, seeding, and simple CRUD queries. Keeping this
+separate from parking.py means the storage layer can be swapped out
+(e.g. for Postgres later) without touching business rules.
 """
 
 import sqlite3
@@ -40,7 +42,14 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 slot_number TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL DEFAULT 'FREE'
-                    CHECK(status IN ('FREE', 'OCCUPIED'))
+                    CHECK(status IN ('FREE', 'OCCUPIED')),
+                -- is_enabled lets capacity shrink WITHOUT deleting rows.
+                -- A slot row can never be deleted once a session has
+                -- referenced it (that would break the FK on session.slot_id
+                -- and destroy history), so "removing" a slot means taking
+                -- it out of service, not dropping it from the table.
+                is_enabled INTEGER NOT NULL DEFAULT 1
+                    CHECK (is_enabled IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS vehicle(
@@ -72,6 +81,16 @@ def init_db():
             );
             """
         )
+
+        # Migration: anyone running a DB created before is_enabled existed
+        # gets the column added in place — ALTER TABLE ADD COLUMN is safe
+        # and non-destructive in SQLite, no data is touched.
+        cursor.execute("PRAGMA table_info(slots);")
+        existing_columns = {row["name"] for row in cursor.fetchall()}
+        if "is_enabled" not in existing_columns:
+            cursor.execute(
+                "ALTER TABLE slots ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1;"
+            )
 
         cursor.execute("SELECT COUNT(*) FROM pricing_tiers")
         if cursor.fetchone()[0] == 0:
@@ -106,33 +125,44 @@ def seed_slots(total_slots=20):
 # ---------------------------------------------------------------------
 
 def first_free_slot():
+    """Only ever offers an enabled, FREE slot — a disabled slot is
+    effectively out of service and must never be assigned."""
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT * FROM slots WHERE status='FREE' ORDER BY id LIMIT 1;"
+            "SELECT * FROM slots WHERE status='FREE' AND is_enabled=1 "
+            "ORDER BY id LIMIT 1;"
         )
         row = cursor.fetchone()
         return dict(row) if row else None
 
 
 def get_slot_grid():
+    """Driver-facing grid — disabled slots are out of service and simply
+    don't appear, matching a reduced lot capacity."""
     with get_conn() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, slot_number, status FROM slots ORDER BY id;")
+        cursor.execute(
+            "SELECT id, slot_number, status FROM slots "
+            "WHERE is_enabled=1 ORDER BY id;"
+        )
         return [dict(r) for r in cursor.fetchall()]
 
 
 def count_available_slots():
     with get_conn() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM slots WHERE status='FREE';")
+        cursor.execute(
+            "SELECT COUNT(*) FROM slots WHERE status='FREE' AND is_enabled=1;"
+        )
         return cursor.fetchone()[0]
 
 
 def count_total_slots():
+    """Total slots currently in service (enabled), i.e. the lot's capacity."""
     with get_conn() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM slots;")
+        cursor.execute("SELECT COUNT(*) FROM slots WHERE is_enabled=1;")
         return cursor.fetchone()[0]
 
 
@@ -140,6 +170,73 @@ def set_slot_status(slot_id, status):
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE slots SET status=? WHERE id=?;", (status, slot_id))
+
+
+def add_slots(count):
+    """Increase capacity by `count`. Re-enables previously disabled slots
+    first (oldest slot_number first) so numbering stays compact, then
+    creates brand-new numbered slots for anything still needed."""
+    added = []
+    with get_conn() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT id, slot_number FROM slots WHERE is_enabled=0 "
+            "ORDER BY id ASC LIMIT ?;",
+            (count,),
+        )
+        to_reenable = cursor.fetchall()
+        for row in to_reenable:
+            cursor.execute(
+                "UPDATE slots SET is_enabled=1, status='FREE' WHERE id=?;",
+                (row["id"],),
+            )
+            added.append(row["slot_number"])
+
+        remaining = count - len(to_reenable)
+        for _ in range(remaining):
+            # Insert with a placeholder, then name it after its own id so
+            # numbers never collide even if earlier slots were re-enabled
+            # out of order.
+            cursor.execute(
+                "INSERT INTO slots (slot_number, status, is_enabled) "
+                "VALUES ('PENDING', 'FREE', 1);"
+            )
+            new_id = cursor.lastrowid
+            slot_number = f"A{new_id}"
+            cursor.execute(
+                "UPDATE slots SET slot_number=? WHERE id=?;", (slot_number, new_id)
+            )
+            added.append(slot_number)
+
+    return added
+
+
+def disable_slots(count):
+    """Decrease capacity by up to `count`. Only ever disables slots that
+    are currently FREE — an OCCUPIED slot can never be pulled out of
+    service while a vehicle is parked in it. Prefers disabling the
+    highest slot_numbers first, leaving the original numbering intact.
+    Returns how many were actually disabled and any shortfall."""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, slot_number FROM slots WHERE status='FREE' AND is_enabled=1 "
+            "ORDER BY id DESC LIMIT ?;",
+            (count,),
+        )
+        rows = cursor.fetchall()
+        for row in rows:
+            cursor.execute(
+                "UPDATE slots SET is_enabled=0 WHERE id=?;", (row["id"],)
+            )
+
+    disabled_numbers = [r["slot_number"] for r in rows]
+    return {
+        "disabled": disabled_numbers,
+        "requested": count,
+        "shortfall": count - len(disabled_numbers),
+    }
 
 
 # ---------------------------------------------------------------------
@@ -225,6 +322,23 @@ def get_pricing_tiers():
 # ---------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------
+
+def get_parked_vehicles():
+    """Every vehicle currently in the lot — is_active=1 covers both:
+      - still parked, no exit requested yet (exit_time IS NULL)
+      - already exited and billed, but unpaid (exit_time set, paid=0)
+    Joined with slots so the UI gets the human-readable slot_number
+    instead of just the numeric slot_id."""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT session.*, slots.slot_number FROM session "
+            "JOIN slots ON slots.id = session.slot_id "
+            "WHERE session.is_active = 1 "
+            "ORDER BY session.entry_time ASC;"
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
 
 def get_history(limit=50):
     with get_conn() as conn:
